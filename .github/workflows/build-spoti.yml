@@ -1,0 +1,104 @@
+
+name: Build spoti.pw 0.51 IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: 'Direct HTTPS URL to your decrypted Spotify IPA'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  inject:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout upstream release resources
+        uses: actions/checkout@v4
+        with:
+          repository: skopevoj/spoti.pw
+          ref: v0.51.0-beta.1
+          persist-credentials: false
+
+      - name: Install injection dependencies
+        run: |
+          brew install dpkg ldid
+          python3 -m pip install --user --break-system-packages git+https://github.com/asdfzxcvbn/pyzule-rw.git
+          echo "$(python3 -m site --user-base)/bin" >> "$GITHUB_PATH"
+
+      - name: Download your Spotify IPA
+        env:
+          IPA_URL: ${{ inputs.ipa_url }}
+        run: |
+          mkdir -p ipa out
+          echo "::add-mask::$IPA_URL"
+          curl --fail --location --silent --show-error "$IPA_URL" -o ipa/spotify.ipa
+          unzip -tq ipa/spotify.ipa > /dev/null
+          unzip -Z1 ipa/spotify.ipa | grep -qE '^Payload/[^/]+\.app/Info.plist$' || {
+            echo '::error::Missing Payload/*.app/Info.plist'
+            exit 1
+          }
+
+      - name: Download compiled 0.51 beta tweak
+        run: |
+          set -euo pipefail
+
+          curl -fsSL \
+            -H 'Accept: application/vnd.github+json' \
+            'https://api.github.com/repos/skopevoj/spoti.pw/releases/tags/v0.51.0-beta.1' \
+            -o /tmp/release.json
+
+          DEB_URL="$(python3 - <<'PY'
+          import json
+          data = json.load(open('/tmp/release.json'))
+          assets = [
+              a for a in data.get('assets', [])
+              if a['name'].endswith('.deb')
+              and 'iphoneos' in a['name']
+          ]
+          if len(assets) != 1:
+              raise SystemExit(
+                  f'Expected one iPhoneOS .deb, found: {[a["name"] for a in assets]}'
+              )
+          print(assets[0]['browser_download_url'])
+          PY
+          )"
+
+          curl -fLsS "$DEB_URL" -o /tmp/spoti.pw-0.51.deb
+
+          echo 'DEB metadata:'
+          dpkg-deb -f /tmp/spoti.pw-0.51.deb Package Version Architecture
+
+          VERSION="$(dpkg-deb -f /tmp/spoti.pw-0.51.deb Version)"
+          case "$VERSION" in
+            *0.51*) ;;
+            *)
+              echo "::error::Unexpected .deb version: $VERSION"
+              exit 1
+              ;;
+          esac
+
+      - name: Inject released tweak into IPA
+        run: |
+          set -euo pipefail
+
+          cyan \
+            -i ipa/spotify.ipa \
+            -o out/spoti.pw-0.51.0-beta.1.ipa \
+            -f /tmp/spoti.pw-0.51.deb \
+            -l plist/liquid-glass.plist \
+            -w -s --overwrite
+
+          unzip -tq out/spoti.pw-0.51.0-beta.1.ipa >/dev/null
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: spoti-pw-051-unsigned-ipa
+          path: out/spoti.pw-0.51.0-beta.1.ipa
+          if-no-files-found: error
+          retention-days: 3
